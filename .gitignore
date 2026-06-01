@@ -1,0 +1,20 @@
+# Credenciais - NUNCA COMMITAR
+.env
+*.env
+token.json
+auth_state.json
+credentials.json
+*.secret
+
+# Python
+__pycache__/
+*.py[codz]
+.venv/
+venv/
+
+# PyCharm
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
