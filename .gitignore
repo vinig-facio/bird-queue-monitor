@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# === SEGURANÇA - ARQUIVOS COM CREDENCIAIS ===
+token.json
+auth_state.json
+credentials.json
+*.secret
