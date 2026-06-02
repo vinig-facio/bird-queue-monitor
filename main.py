@@ -16,7 +16,7 @@ HORA_INICIO = 9  # 09:00 - início
 HORA_FIM = 18  # 18:00 - fim do expediente
 HARDCAP_HORA = 22  # 22:00 - hard stop (segurança)
 REQUEST_TIMEOUT = 15
-TOKEN_EXPIRY_HOURS = 23
+TOKEN_EXPIRY_HOURS = 23  # 23 horas (margem de segurança)
 REQUEST_RETRIES = 2
 MAX_PAGINATION_PAGES = 50
 # ====================================
@@ -35,6 +35,7 @@ class BirdMonitor:
         self.password = os.getenv('BIRD_PASSWORD')
         self.sheets_url = os.getenv('GOOGLE_APPS_SCRIPT_URL')
         self.token = None
+        self.token_expiry = None  # Guarda expiry do token
         self.token_file = Path('token.json')
         self._session = requests.Session()
         self._session.headers.update({
@@ -42,6 +43,9 @@ class BirdMonitor:
             'Accept': 'application/json'
         })
         self._validate_config()
+
+        # Tenta carregar token na inicialização
+        self._load_token()
 
     def _validate_config(self):
         if not self.email or '@' not in self.email:
@@ -54,6 +58,7 @@ class BirdMonitor:
 
     def _load_token(self) -> Optional[str]:
         if not self.token_file.exists():
+            logger.debug("Arquivo token.json não encontrado")
             return None
 
         try:
@@ -61,20 +66,26 @@ class BirdMonitor:
                 data = json.load(f)
 
             expiry = datetime.fromisoformat(data['expiry'])
-            if expiry > datetime.now():
+            now = datetime.now()
+
+            if expiry > now:
                 self.token = data['token']
-                logger.info("Token reutilizado do cache")
+                self.token_expiry = expiry
+                hours_left = (expiry - now).total_seconds() / 3600
+                logger.info(f"✅ Token reutilizado do cache (expira em {hours_left:.1f}h)")
                 return self.token
             else:
-                logger.debug("Token expirado")
+                logger.info(f"⏰ Token expirado (expirou em {expiry})")
                 self.token_file.unlink(missing_ok=True)
                 return None
-        except (json.JSONDecodeError, KeyError, ValueError):
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.warning(f"Erro ao ler token: {e}")
             self.token_file.unlink(missing_ok=True)
             return None
 
     def _save_token(self, token: str):
         expiry = datetime.now() + timedelta(hours=TOKEN_EXPIRY_HOURS)
+        self.token_expiry = expiry
         with open(self.token_file, 'w') as f:
             json.dump({
                 'token': token,
@@ -83,6 +94,10 @@ class BirdMonitor:
         logger.debug(f"Token salvo (expira às {expiry.strftime('%H:%M')})")
 
     def login_and_get_token(self) -> Optional[str]:
+        # Primeiro tenta carregar do cache
+        if self.token:
+            return self.token
+
         cached = self._load_token()
         if cached:
             return cached
@@ -136,19 +151,34 @@ class BirdMonitor:
                 if self.token:
                     self._save_token(self.token)
                     login_time = (datetime.now() - start_time).total_seconds()
-                    logger.info(f"Login realizado com sucesso ({login_time:.1f}s)")
+                    logger.info(f"✅ Login realizado com sucesso ({login_time:.1f}s)")
                     return self.token
                 else:
-                    logger.error("Token não encontrado após login")
+                    logger.error("❌ Token não encontrado após login")
                     return None
 
         except Exception as e:
-            logger.error(f"Erro no login: {type(e).__name__}")
+            logger.error(f"❌ Erro no login: {type(e).__name__}")
             return None
+
+    def ensure_token(self) -> bool:
+        """Garante que temos um token válido"""
+        if not self.token:
+            self.token = self._load_token()
+
+        if not self.token:
+            logger.info("Token não encontrado, realizando login...")
+            self.token = self.login_and_get_token()
+
+        if self.token:
+            return True
+        else:
+            logger.error("❌ Não foi possível obter token válido")
+            return False
 
     def _fetch_all_items(self) -> Tuple[Optional[List], Optional[int]]:
         """Busca TODOS os itens da fila usando paginação com pageToken"""
-        if not self.token:
+        if not self.ensure_token():
             return None, None
 
         headers = {"Authorization": f"Bearer {self.token}"}
@@ -161,7 +191,6 @@ class BirdMonitor:
 
         try:
             while page <= MAX_PAGINATION_PAGES:
-                # Constrói URL base
                 url = (
                     f"https://api.bird.com/workspaces/dbd7eacd-6312-441f-86dd-d933200b3e3f/"
                     f"feeds/queue:01984c00-922a-7bb5-aa7a-624fb399892c/items"
@@ -172,7 +201,6 @@ class BirdMonitor:
                     f"&limit=20"
                 )
 
-                # Adiciona pageToken se existir
                 if next_token:
                     url += f"&pageToken={next_token}"
 
@@ -183,7 +211,11 @@ class BirdMonitor:
                     logger.info("Token expirado. Renovando...")
                     self.token_file.unlink(missing_ok=True)
                     self.token = None
-                    return None, None
+                    if self.ensure_token():
+                        headers = {"Authorization": f"Bearer {self.token}"}
+                        continue
+                    else:
+                        return None, None
 
                 if resp.status_code != 200:
                     logger.error(f"Erro HTTP {resp.status_code} na página {page}")
@@ -191,17 +223,17 @@ class BirdMonitor:
 
                 data = resp.json()
 
-                # Seta total_oficial na primeira página
                 if page == 1:
                     total_oficial = data.get('total', 0)
+                    if total_oficial == 0:
+                        logger.info("📭 Fila vazia! Nenhum cliente aguardando.")
+                        return [], 0
                     logger.info(f"Total oficial da fila: {total_oficial} clientes")
 
                 results = data.get('results', [])
                 if not results:
-                    logger.debug(f"Página {page} sem resultados, encerrando")
                     break
 
-                # Adiciona itens novos
                 novos = 0
                 for item in results:
                     item_id = item.get('id')
@@ -212,23 +244,18 @@ class BirdMonitor:
 
                 logger.debug(f"Página {page}: {len(results)} recebidos, {novos} novos (total: {len(all_items)})")
 
-                # Verifica se tem próxima página
                 next_token = data.get('nextPageToken')
                 if not next_token:
-                    logger.debug(f"Última página atingida")
                     break
 
                 page += 1
 
-                # Pausa a cada 10 páginas para não sobrecarregar a API
                 if page % 10 == 0:
                     import time
                     time.sleep(0.5)
 
-            logger.info(f"✅ Paginação finalizada: {len(all_items)} itens | Total oficial: {total_oficial}")
-
-            if len(all_items) != total_oficial:
-                logger.warning(f"⚠️ Discrepância: {len(all_items)} coletados vs {total_oficial} oficial")
+            if total_oficial > 0:
+                logger.info(f"✅ Paginação finalizada: {len(all_items)} itens | Total oficial: {total_oficial}")
 
             return all_items, total_oficial
 
@@ -240,13 +267,20 @@ class BirdMonitor:
             return None, None
 
     def check_queue(self) -> Optional[Dict[str, Any]]:
-        if not self.token:
-            if not self.login_and_get_token():
-                return None
+        if not self.ensure_token():
+            return None
 
         items, total = self._fetch_all_items()
         if items is None:
             return None
+
+        # Se não há itens na fila
+        if total == 0 or len(items) == 0:
+            logger.info("📭 Fila vazia - nenhum cliente no momento")
+            return {
+                'data': [0, 0, 0, 0, 0, 0],
+                'timestamp': datetime.now().isoformat()
+            }
 
         aguardando = 0
         com_bot = 0
@@ -264,7 +298,6 @@ class BirdMonitor:
             else:
                 em_atendimento += 1
 
-            # Verifica SLA baseado no slaPolicy.timers
             sla_policy = item.get('slaPolicy', {})
             for timer in sla_policy.get('timers', []):
                 if (timer.get('metric') == 'firstReplyTime' and
@@ -272,7 +305,6 @@ class BirdMonitor:
                     sla_estourado += 1
                     break
 
-            # Calcula tempo de espera
             queue_info = item.get('queueInfo', {})
             queued_at = queue_info.get('queuedAt')
 
@@ -297,7 +329,7 @@ class BirdMonitor:
         tempo_medio = round(sum(tempos_espera) / len(tempos_espera), 1) if tempos_espera else 0
 
         return {
-            'data': [aguardando, com_bot, em_atendimento, sla_estourado, total or 0, tempo_medio],
+            'data': [aguardando, com_bot, em_atendimento, sla_estourado, total, tempo_medio],
             'timestamp': now.isoformat()
         }
 
@@ -306,6 +338,7 @@ class BirdMonitor:
             logger.warning("URL do Google Sheets não configurada")
             return False
 
+        # Se fila vazia, ainda assim envia zeros
         try:
             resp = self._session.post(
                 self.sheets_url,
@@ -330,38 +363,29 @@ class BirdMonitor:
         hora = agora.hour
         minuto = agora.minute
 
-        # Hard stop às 22h
         if hora >= HARDCAP_HORA:
-            logger.info(f"⏹️ Hardcap {HARDCAP_HORA}h atingido às {hora:02d}:{minuto:02d}. Encerrando.")
+            logger.info(f"⏹️ Hardcap {HARDCAP_HORA}h atingido. Encerrando.")
             return None
 
-        # Antes do expediente
         if hora < HORA_INICIO:
             logger.debug(f"Fora do horário ({hora:02d}:{minuto:02d})")
             return None
 
-        # Overtime (após 18h)
-        if hora >= HORA_FIM:
-            dados = self.check_queue()
-            if dados and dados['data'][4] > 0:
-                logger.info(f"🕒 Overtime! {dados['data'][4]} clientes na fila às {hora:02d}:{minuto:02d}")
-                self.send_to_sheets(dados)
-                d = dados['data']
-                logger.info(
-                    f"Total: {d[4]} | Aguardando: {d[0]} | Bot: {d[1]} | Atend: {d[2]} | SLA: {d[3]} | TmpMéd: {d[5]}min")
-                return dados
-            elif dados:
-                logger.info(f"✅ Fila zerada às {hora:02d}:{minuto:02d}. Bom descansar!")
-                return None
-            return None
-
-        # Horário normal
         dados = self.check_queue()
         if dados:
             self.send_to_sheets(dados)
             d = dados['data']
-            logger.info(
-                f"Total: {d[4]} | Aguardando: {d[0]} | Bot: {d[1]} | Atend: {d[2]} | SLA: {d[3]} | TmpMéd: {d[5]}min")
+
+            if d[4] == 0:  # Fila vazia
+                logger.info(f"📭 Fila vazia às {hora:02d}:{minuto:02d}")
+            else:
+                logger.info(
+                    f"Total: {d[4]} | Aguardando: {d[0]} | Bot: {d[1]} | Atend: {d[2]} | SLA: {d[3]} | TmpMéd: {d[5]}min")
+
+            # Overtime check
+            if hora >= HORA_FIM and d[4] > 0:
+                logger.info(f"🕒 Overtime! {d[4]} clientes na fila após {HORA_FIM}h")
+
             return dados
 
         return None
@@ -389,10 +413,10 @@ def test_local():
         print(f"\n--- Iteração {i + 1} ---")
         resultado = monitor.run_once()
 
-        if resultado:
+        if resultado is not None:
             print(f"✅ Iteração {i + 1} concluída!")
         else:
-            print(f"❌ Iteração {i + 1} falhou!")
+            print(f"⚠️ Iteração {i + 1} - nenhum dado coletado (fila vazia ou fora do horário)")
 
         if i < 1:
             print("Aguardando 30 segundos...")
@@ -409,13 +433,21 @@ def debug():
     print("=" * 50)
 
     monitor = BirdMonitor()
-    monitor.login_and_get_token()
+
+    if not monitor.ensure_token():
+        print("❌ Falha ao obter token")
+        return
+
     items, total = monitor._fetch_all_items()
 
-    if items:
-        print(f"\n📊 Total oficial: {total}")
-        print(f"📊 Itens recuperados: {len(items)}")
+    if items is None:
+        print("❌ Erro ao buscar itens")
+        return
 
+    print(f"\n📊 Total oficial: {total}")
+    print(f"📊 Itens recuperados: {len(items)}")
+
+    if items:
         primeiro = items[0]
         print(f"\n📋 Estrutura do primeiro item:")
         print(f"  ID: {primeiro.get('id')}")
@@ -424,7 +456,7 @@ def debug():
         print(f"  queueInfo keys: {list(queue_info.keys())}")
         print(f"  queuedAt: {queue_info.get('queuedAt')}")
     else:
-        print("❌ Nenhum item encontrado")
+        print("📭 Fila vazia - nenhum cliente no momento")
 
     print("=" * 50)
 
