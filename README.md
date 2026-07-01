@@ -25,7 +25,6 @@ Monitor em tempo real da fila de atendimento do Bird, com alertas no Slack e das
 - **Requests** (consumo da API)
 - **Google Sheets API** (dashboard)
 - **Slack Webhook** (alertas)
-- **GitHub Actions** (execução agendada)
 
 ## 🛠️ Instalação Local
 
@@ -44,5 +43,5 @@ echo "BIRD_EMAIL=seu.email@empresa.com" > .env
 echo "BIRD_PASSWORD=sua_senha" >> .env
 
 # Execute
-python main.py
+python main.py --test
 ```
